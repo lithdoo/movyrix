@@ -17,12 +17,109 @@ The exact port is implementation-defined during bootstrap.
 
 Each WebSocket text message contains one JSON-RPC 2.0 object. Batch requests are not required for the first implementation.
 
-## 2. Request
+The built-in application UI should connect through this same WebSocket endpoint instead of using a separate privileged control API.
+
+Movyrix may have multiple simultaneous clients:
+
+```text
+                    Movyrix Engine
+                          |
+             +------------+------------+
+             |            |            |
+        Built-in UI   Android remote   Web client
+```
+
+## 2. Multi-client semantics
+
+The Movyrix Engine is the authoritative state owner.
+
+Commands are sent by one client, but confirmed state changes are normally broadcast to all connected clients.
+
+Example:
+
+```text
+Client B -> player.pause -> Engine
+                         -> playback becomes paused
+                         -> event.playbackState -> Client A
+                                                -> Client B
+                                                -> Client C
+```
+
+Clients should not assume that a request succeeded until the response and/or resulting state event confirms it.
+
+On connection or reconnection, the expected synchronization flow is:
+
+```text
+connect
+  -> client.hello
+  -> player.state
+  -> render snapshot
+  -> consume incremental events
+```
+
+This is the core synchronization model:
+
+```text
+Snapshot + Incremental Events
+```
+
+## 3. Client identification
+
+### `client.hello`
+
+A client should identify itself immediately after establishing the WebSocket connection.
+
+Example request:
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
+  "method": "client.hello",
+  "params": {
+    "name": "Movyrix Android",
+    "version": "0.1.0",
+    "protocolVersion": "0.1",
+    "kind": "built-in",
+    "platform": "android"
+  }
+}
+```
+
+Suggested `kind` values:
+
+```text
+built-in
+remote
+web
+automation
+```
+
+Example response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "clientId": "c_01JABC...",
+    "serverVersion": "0.1.0",
+    "protocolVersion": "0.1",
+    "authenticated": true
+  }
+}
+```
+
+`clientId` is an opaque server-assigned identifier for the connection/client session.
+
+Future versions may include capabilities, permissions, authentication state, device identity, or negotiated protocol features.
+
+## 4. Request
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 10,
   "method": "player.pause"
 }
 ```
@@ -32,7 +129,7 @@ A command that accepts parameters:
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 2,
+  "id": 11,
   "method": "player.seek",
   "params": {
     "position": 123.5
@@ -40,12 +137,12 @@ A command that accepts parameters:
 }
 ```
 
-## 3. Successful response
+## 5. Successful response
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 2,
+  "id": 11,
   "result": {
     "ok": true
   }
@@ -57,7 +154,7 @@ Read methods may return structured data directly:
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 3,
+  "id": 12,
   "result": {
     "state": "playing",
     "position": 123.5,
@@ -69,12 +166,12 @@ Read methods may return structured data directly:
 }
 ```
 
-## 4. Error response
+## 6. Error response
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 4,
+  "id": 13,
   "error": {
     "code": -32001,
     "message": "Media not found",
@@ -97,11 +194,14 @@ Suggested application error range:
 -32006  Permission denied
 -32007  Backend unavailable
 -32008  Invalid media URI
+-32009  Authentication required
+-32010  Unauthorized client
+-32011  Protocol version mismatch
 ```
 
 Standard JSON-RPC errors should retain their standard meanings.
 
-## 5. Notifications and events
+## 7. Notifications and events
 
 Server-to-client events use JSON-RPC notifications (no `id`).
 
@@ -145,7 +245,9 @@ Media loaded:
 }
 ```
 
-## 6. Player methods
+Unless explicitly documented otherwise, state-changing domain events should be broadcast to every authorized connected client.
+
+## 8. Player methods
 
 ### `player.play`
 
@@ -154,7 +256,7 @@ Resume/start playback.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 10,
+  "id": 20,
   "method": "player.play"
 }
 ```
@@ -166,7 +268,7 @@ Pause playback.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 11,
+  "id": 21,
   "method": "player.pause"
 }
 ```
@@ -182,7 +284,7 @@ Seek to an absolute position in seconds.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 12,
+  "id": 22,
   "method": "player.seek",
   "params": {
     "position": 600.25
@@ -192,9 +294,11 @@ Seek to an absolute position in seconds.
 
 Future versions may add explicit relative seeking instead of overloading this method.
 
+A completed seek should produce an immediate authoritative position update for all clients.
+
 ### `player.state`
 
-Return a full state snapshot. This is the primary reconnection/synchronization method.
+Return a full state snapshot. This is the primary connection/reconnection synchronization method.
 
 Example result:
 
@@ -220,7 +324,7 @@ Example result:
 }
 ```
 
-## 7. Media methods
+## 9. Media methods
 
 ### `media.open`
 
@@ -229,7 +333,7 @@ Open a media URI.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 20,
+  "id": 30,
   "method": "media.open",
   "params": {
     "uri": "D:\\Movies\\movie.mkv"
@@ -239,6 +343,8 @@ Open a media URI.
 
 Opening a media item does not require clients to know backend-specific file-loading commands.
 
+Remote clients may be subject to stricter URI/file-access policy than the built-in client. The protocol should not imply unrestricted remote filesystem access.
+
 ### `media.close`
 
 Close the current media.
@@ -247,14 +353,14 @@ Close the current media.
 
 Return metadata for the currently loaded media.
 
-## 8. Audio methods
+## 10. Audio methods
 
 ### `audio.volume.set`
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 30,
+  "id": 40,
   "method": "audio.volume.set",
   "params": {
     "value": 80.0
@@ -267,7 +373,7 @@ Return metadata for the currently loaded media.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 31,
+  "id": 41,
   "method": "audio.mute.set",
   "params": {
     "muted": true
@@ -280,7 +386,7 @@ Return metadata for the currently loaded media.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 32,
+  "id": 42,
   "method": "audio.track.set",
   "params": {
     "id": "audio:2"
@@ -288,14 +394,14 @@ Return metadata for the currently loaded media.
 }
 ```
 
-## 9. Subtitle methods
+## 11. Subtitle methods
 
 ### `subtitle.track.set`
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 40,
+  "id": 50,
   "method": "subtitle.track.set",
   "params": {
     "id": "subtitle:4"
@@ -308,7 +414,7 @@ Use `null` to disable subtitles:
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 41,
+  "id": 51,
   "method": "subtitle.track.set",
   "params": {
     "id": null
@@ -323,7 +429,7 @@ Load an external subtitle resource.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 42,
+  "id": 52,
   "method": "subtitle.add",
   "params": {
     "uri": "D:\\Movies\\movie.zh-CN.ass"
@@ -335,7 +441,7 @@ Load an external subtitle resource.
 
 Set subtitle timing offset in seconds.
 
-## 10. Track discovery
+## 12. Track discovery
 
 A future `media.tracks` or `player.tracks` method should return normalized track objects.
 
@@ -372,7 +478,7 @@ Example:
 
 Protocol track IDs are opaque and should not be treated as raw libmpv IDs by clients.
 
-## 11. Playlist methods
+## 13. Playlist methods
 
 Planned methods:
 
@@ -387,7 +493,7 @@ playlist.previous
 
 Exact schemas will be added when playlist behavior is implemented.
 
-## 12. System methods
+## 14. System methods
 
 Planned methods include:
 
@@ -399,12 +505,14 @@ system.capabilities
 
 `system.capabilities` should eventually expose feature support without leaking backend implementation details.
 
-## 13. Event catalog
+## 15. Event catalog
 
 Initial planned notifications:
 
 ```text
 event.connected
+event.clientConnected
+event.clientDisconnected
 event.mediaLoaded
 event.mediaClosed
 event.playbackState
@@ -422,7 +530,9 @@ event.error
 
 Not every backend event needs a public RPC event. Only stable domain-level events should cross the protocol boundary.
 
-## 14. Position update policy
+Client presence events may later be restricted to privileged/built-in clients if exposing connected-client metadata would create a privacy concern.
+
+## 16. Position update policy
 
 The native backend may update playback position far more frequently than clients need.
 
@@ -430,11 +540,29 @@ Recommended server behavior:
 
 - emit `event.position` around 4-10 Hz during normal playback
 - emit an immediate position event after a completed seek
+- broadcast the authoritative position to all relevant clients
 - allow clients to interpolate the progress bar between notifications
 
 This keeps UI smooth without generating unnecessary JSON/WebSocket traffic.
 
-## 15. Versioning
+## 17. Connection lifecycle
+
+Recommended initial client lifecycle:
+
+```text
+1. Open WebSocket
+2. Send client.hello
+3. Complete authentication/pairing if required
+4. Call player.state
+5. Render snapshot
+6. Consume events
+7. Reconnect on transport failure
+8. Repeat state snapshot after reconnect
+```
+
+A client must assume that events may have been missed while disconnected. Reconnection therefore requires a fresh snapshot rather than replaying assumptions from local state.
+
+## 18. Versioning
 
 The protocol should gain an explicit version before external clients are considered stable.
 
@@ -450,20 +578,62 @@ Possible discovery response:
 
 Breaking protocol changes should require a protocol-version bump.
 
-## 16. Security
+`client.hello` should eventually participate in protocol-version negotiation or reject incompatible clients explicitly.
 
-For the local-only phase:
+## 19. Local vs. remote security
 
-- bind to loopback by default
+### Local-only mode
+
+By default:
+
+```text
+bind: 127.0.0.1 / ::1
+```
+
+The built-in UI connects over loopback.
+
+Baseline requirements:
+
 - validate browser origins
 - validate request schema and parameter ranges
 - cap message size
+- limit concurrent connections
 - reject arbitrary backend commands/properties
 - avoid generic filesystem RPC methods
 
-For LAN/remote access, authentication/pairing must be introduced before non-loopback binding is enabled by default.
+### Remote-control mode
 
-## 17. Non-goal
+LAN access must be explicitly enabled by the user before binding to a non-loopback interface.
+
+Remote access should require a pairing/authentication mechanism such as:
+
+```text
+remote client connects
+    -> pairing required
+    -> user confirms code
+    -> server issues credential/token
+    -> subsequent authenticated connection
+```
+
+The server should support client credential revocation.
+
+Remote clients may receive a smaller permission set than the built-in client, particularly for filesystem and application-management operations.
+
+## 20. Built-in client principle
+
+The built-in application UI should use the same RPC methods and event semantics as external clients.
+
+Benefits:
+
+- the primary UI continuously exercises the public protocol
+- fewer hidden internal-only APIs
+- consistent local and remote behavior
+- easier integration testing
+- easier future separation of Engine and UI processes
+
+An optimization layer may later replace loopback WebSocket with an in-process transport, but only if it preserves the exact same protocol semantics.
+
+## 21. Non-goal
 
 The RPC channel is **not** a media transport.
 
